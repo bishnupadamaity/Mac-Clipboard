@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Test
+        run: swift test
+
+      # Catches the architecture regression that would strand Intel users: the app
+      # must stay universal, and both slices must keep the macOS 13 deployment target.
+      - name: Build universal app bundle
+        run: ./build.sh
+
+      - name: Verify the bundle is universal and targets macOS 13
+        run: |
+          set -euo pipefail
+          BIN=ClipStack.app/Contents/MacOS/ClipStack
+          archs=$(lipo -archs "$BIN")
+          echo "architectures: $archs"
+          for want in arm64 x86_64; do
+            case "$archs" in *"$want"*) ;; *) echo "::error::missing $want slice"; exit 1 ;; esac
+          done
+          for arch in arm64 x86_64; do
+            minos=$(otool -l -arch $arch "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+            echo "$arch minos: $minos"
+            [ "$minos" = "13.0" ] || { echo "::error::$arch targets $minos, expected 13.0"; exit 1; }
+          done
+
+      - name: Verify the bundle carries required metadata
+        run: |
+          set -euo pipefail
+          plist=ClipStack.app/Contents/Info.plist
+          for key in CFBundleIdentifier CFBundleVersion CFBundleShortVersionString; do
+            value=$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")
+            echo "$key = $value"
+            [ -n "$value" ] || { echo "::error::$key is empty"; exit 1; }
+          done
+          # The placeholder identifier must never ship again.
+          case "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" in
+            com.example.*) echo "::error::bundle identifier is still a placeholder"; exit 1 ;;
+          esac

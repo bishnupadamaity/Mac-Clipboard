@@ -5,6 +5,10 @@ let package = Package(
     name: "ClipStack",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(name: "ClipStack", path: "Sources/ClipStack")
+        // Capture, storage and retention live in a library so they can be tested;
+        // the executable is the AppKit/SwiftUI shell around them.
+        .target(name: "ClipStackCore", path: "Sources/ClipStackCore"),
+        .executableTarget(name: "ClipStack", dependencies: ["ClipStackCore"], path: "Sources/ClipStack"),
+        .testTarget(name: "ClipStackCoreTests", dependencies: ["ClipStackCore"], path: "Tests/ClipStackCoreTests"),
     ]
 )

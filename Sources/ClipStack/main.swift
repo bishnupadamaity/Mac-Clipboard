@@ -1,393 +1,9 @@
+import ClipStackCore
 import AppKit
 import SwiftUI
 import Carbon.HIToolbox
 import ServiceManagement
 import os.log
-
-// MARK: - Logging
-
-/// Logs to the unified log (`log stream --predicate 'subsystem == "com.inneitec.ClipStack"'`)
-/// and to ~/Library/Logs/ClipStack.log so problems are diagnosable after the fact.
-let logger = Logger(subsystem: "com.inneitec.ClipStack", category: "app")
-
-private let logFileURL: URL = FileManager.default
-    .urls(for: .libraryDirectory, in: .userDomainMask)[0]
-    .appendingPathComponent("Logs/ClipStack.log")
-
-private let logQueue = DispatchQueue(label: "com.inneitec.ClipStack.log")
-
-func log(_ message: String) {
-    logger.info("\(message, privacy: .public)")
-    logQueue.async {
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        guard let data = "\(stamp) \(message)\n".data(using: .utf8) else { return }
-        if let handle = try? FileHandle(forWritingTo: logFileURL) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? FileManager.default.createDirectory(
-                at: logFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: logFileURL)
-        }
-    }
-}
-
-// MARK: - Model & storage
-
-struct ClipItem: Codable, Identifiable, Equatable {
-    var id = UUID()
-    var text: String
-    var date = Date()
-    var pinned = false
-}
-
-/// User-editable settings, kept as JSON beside the history because there is no
-/// preferences window yet. Re-read whenever the file changes, so an edit takes effect
-/// without restarting the app.
-struct ClipSettings: Codable {
-    /// Age after which unpinned items are discarded. 0 disables expiry entirely.
-    var retentionDays: Int = 30
-    /// Discard unpinned history as soon as the screen locks.
-    var clearOnScreenLock: Bool = false
-    /// Apps whose copies are never recorded.
-    var excludedBundleIDs: [String] = ClipSettings.defaultExcludedBundleIDs
-    /// Largest clip to keep. Bigger copies stay on the system clipboard but are not
-    /// stored, so one huge paste cannot bloat every subsequent write.
-    var maxItemKilobytes: Int = 1024
-    /// Put the previous clipboard back after pasting a picked item, so a following
-    /// ⌘V does what the user expects rather than repeating the pick.
-    var restoreClipboardAfterPaste: Bool = true
-
-    /// The org.nspasteboard.* markers cover apps that cooperate. These are the common
-    /// credential holders that do not set them, so they have to be excluded by identity.
-    static let defaultExcludedBundleIDs = [
-        "com.1password.1password",
-        "com.1password.1password7",
-        "com.agilebits.onepassword7",
-        "com.bitwarden.desktop",
-        "com.lastpass.LastPass",
-        "in.sinew.Enpass-Desktop",
-        "com.dashlane.Dashlane",
-        "com.keepersecurity.KeeperDesktop",
-        "com.apple.keychainaccess",
-    ]
-}
-
-final class ClipStore: ObservableObject {
-    @Published var items: [ClipItem] = []
-    let maxUnpinned = 100
-
-    /// Name of the file an unreadable history was preserved as, so the menu can say so.
-    @Published private(set) var loadFailure: String?
-
-    private let dirURL: URL
-    private let fileURL: URL
-    private let settingsURL: URL
-    private(set) var settings = ClipSettings()
-    private var settingsStamp: Date?
-    private var lastChangeCount = NSPasteboard.general.changeCount
-    private var timer: Timer?
-    /// Set when history could not be parsed *and* could not be moved aside. Saving
-    /// would then overwrite the only copy, so it is refused.
-    private var savingDisabled = false
-    private var pendingSave: DispatchWorkItem?
-
-    var settingsFileURL: URL { settingsURL }
-
-    init() {
-        dirURL = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ClipStack", isDirectory: true)
-        fileURL = dirURL.appendingPathComponent("history.json")
-        settingsURL = dirURL.appendingPathComponent("settings.json")
-
-        // The history is a verbatim record of everything copied, so it must not be
-        // readable by other accounts on the machine. createDirectory ignores the
-        // attributes when the directory already exists, hence the explicit set.
-        try? FileManager.default.createDirectory(
-            at: dirURL, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700],
-                                               ofItemAtPath: dirURL.path)
-
-        loadSettings()
-        load()
-        expire()
-
-        // .common, not the default mode: while a menu is tracking or a window is being
-        // resized the run loop leaves the default mode, and a default-mode timer stops
-        // firing — copies made during that window were silently missed.
-        // .common rather than the default mode. In-process event tracking — a drag, a
-        // resize, a modal tracking loop — leaves the default mode and stops a
-        // default-mode timer firing. Status-bar menus turned out not to block this
-        // app's run loop on macOS 27, so this is hardening against the tracking loops
-        // that do, not a fix for an observed miss.
-        let poller = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.poll()
-        }
-        RunLoop.main.add(poller, forMode: .common)
-        timer = poller
-        observeScreenLock()
-    }
-
-    // MARK: Loading and saving
-
-    /// Never overwrites data it failed to parse: an unreadable file is moved aside so
-    /// the next copy cannot destroy it.
-    private func load() {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            log("history: no existing file, starting empty")
-            return
-        }
-        do {
-            let data = try Data(contentsOf: fileURL)
-            items = try JSONDecoder().decode([ClipItem].self, from: data)
-            log("history: loaded \(items.count) item(s)")
-        } catch {
-            let stamp = ISO8601DateFormatter.filenameSafe.string(from: Date())
-            let backup = dirURL.appendingPathComponent("history.unreadable-\(stamp).json")
-            do {
-                try FileManager.default.moveItem(at: fileURL, to: backup)
-                loadFailure = backup.lastPathComponent
-                log("history: UNREADABLE (\(error.localizedDescription)) — "
-                    + "preserved as \(backup.lastPathComponent), starting empty")
-            } catch {
-                savingDisabled = true
-                loadFailure = fileURL.lastPathComponent
-                log("history: UNREADABLE and could not be moved aside "
-                    + "(\(error.localizedDescription)) — saving disabled to protect it")
-            }
-        }
-    }
-
-    /// Coalesces bursts of changes into one write. The whole history is re-encoded on
-    /// every save, so writing once per copy was wasteful; callers that must not lose
-    /// data on a crash use `writeNow()` instead.
-    private func save() {
-        pendingSave?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.writeNow() }
-        pendingSave = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: work)
-    }
-
-    /// Writes immediately, cancelling any debounced write.
-    func writeNow() {
-        pendingSave?.cancel()
-        pendingSave = nil
-        guard !savingDisabled else {
-            log("history: save refused — an unreadable history file is still in place")
-            return
-        }
-        do {
-            let data = try JSONEncoder().encode(items)
-            try data.write(to: fileURL, options: .atomic)
-            // An atomic write replaces the file, so the mode is reapplied every time.
-            try FileManager.default.setAttributes([.posixPermissions: 0o600],
-                                                  ofItemAtPath: fileURL.path)
-        } catch {
-            log("history: save failed — \(error.localizedDescription)")
-        }
-    }
-
-    // MARK: Settings
-
-    private func loadSettings() {
-        guard FileManager.default.fileExists(atPath: settingsURL.path) else {
-            writeSettings()  // seed defaults so the file is discoverable and editable
-            return
-        }
-        do {
-            let data = try Data(contentsOf: settingsURL)
-            settings = try JSONDecoder().decode(ClipSettings.self, from: data)
-            settingsStamp = modificationDate(of: settingsURL)
-        } catch {
-            log("settings: unreadable, keeping defaults — \(error.localizedDescription)")
-            settingsStamp = modificationDate(of: settingsURL)
-        }
-    }
-
-    private func writeSettings() {
-        do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(settings).write(to: settingsURL, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600],
-                                                  ofItemAtPath: settingsURL.path)
-            settingsStamp = modificationDate(of: settingsURL)
-        } catch {
-            log("settings: could not write — \(error.localizedDescription)")
-        }
-    }
-
-    private func modificationDate(of url: URL) -> Date? {
-        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-    }
-
-    /// Picks up hand edits to settings.json without needing a restart.
-    private func reloadSettingsIfChanged() {
-        let stamp = modificationDate(of: settingsURL)
-        guard stamp != settingsStamp else { return }
-        loadSettings()
-        log("settings: reloaded — retentionDays=\(settings.retentionDays), "
-            + "excluded=\(settings.excludedBundleIDs.count), "
-            + "clearOnScreenLock=\(settings.clearOnScreenLock)")
-        expire()
-    }
-
-    // MARK: Capture
-
-    private func poll() {
-        reloadSettingsIfChanged()
-
-        let pb = NSPasteboard.general
-        guard pb.changeCount != lastChangeCount else { return }
-        lastChangeCount = pb.changeCount
-
-        // Respect password managers and other apps that mark data as secret/temporary.
-        let types = (pb.types ?? []).map(\.rawValue)
-        if types.contains("org.nspasteboard.ConcealedType")
-            || types.contains("org.nspasteboard.TransientType")
-            || types.contains("org.nspasteboard.AutoGeneratedType") { return }
-
-        // Apps that set none of those markers have to be excluded by identity. The
-        // frontmost app just after a copy is the best attribution available without a
-        // pasteboard-owner API; it is a heuristic, not a guarantee.
-        if let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
-           settings.excludedBundleIDs.contains(bundleID) {
-            log("capture: skipped a copy from excluded app \(bundleID)")
-            return
-        }
-
-        guard let s = pb.string(forType: .string),
-              !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-
-        let limit = max(1, settings.maxItemKilobytes) * 1024
-        let size = s.utf8.count
-        if size > limit {
-            log("capture: skipped a \(size / 1024) KB clip (limit \(limit / 1024) KB)")
-            return
-        }
-        add(s)
-    }
-
-    func add(_ text: String) {
-        if let i = items.firstIndex(where: { $0.text == text }) {
-            var item = items.remove(at: i)
-            item.date = Date()
-            items.insert(item, at: 0)
-        } else {
-            items.insert(ClipItem(text: text), at: 0)
-        }
-        expire(save: false)
-        trim()
-        save()
-    }
-
-    /// Everything currently on the pasteboard, flavour by flavour, so it can be put
-    /// back verbatim after a paste.
-    func snapshotPasteboard() -> [[String: Data]] {
-        (NSPasteboard.general.pasteboardItems ?? []).map { item in
-            var flavours: [String: Data] = [:]
-            for type in item.types {
-                if let data = item.data(forType: type) { flavours[type.rawValue] = data }
-            }
-            return flavours
-        }
-    }
-
-    /// Puts a snapshot back and suppresses re-capture, so restoring does not register
-    /// as a new copy.
-    func restorePasteboard(_ snapshot: [[String: Data]]) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        let restored = snapshot.compactMap { flavours -> NSPasteboardItem? in
-            guard !flavours.isEmpty else { return nil }
-            let item = NSPasteboardItem()
-            for (type, data) in flavours {
-                item.setData(data, forType: NSPasteboard.PasteboardType(type))
-            }
-            return item
-        }
-        if !restored.isEmpty { pb.writeObjects(restored) }
-        lastChangeCount = pb.changeCount
-    }
-
-    /// Puts an item on the system clipboard without it being re-added as "new".
-    func copyToPasteboard(_ item: ClipItem) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(item.text, forType: .string)
-        lastChangeCount = pb.changeCount
-        add(item.text)
-    }
-
-    // MARK: Retention
-
-    /// Drops unpinned items past the retention window. Pinned items are exempt —
-    /// pinning is an explicit instruction to keep something.
-    @discardableResult
-    func expire(save shouldSave: Bool = true) -> Int {
-        guard settings.retentionDays > 0 else { return 0 }
-        let cutoff = Date().addingTimeInterval(-Double(settings.retentionDays) * 86_400)
-        let before = items.count
-        items.removeAll { !$0.pinned && $0.date < cutoff }
-        let removed = before - items.count
-        if removed > 0 {
-            log("retention: expired \(removed) item(s) older than \(settings.retentionDays) day(s)")
-            if shouldSave { save() }
-        }
-        return removed
-    }
-
-    private func observeScreenLock() {
-        DistributedNotificationCenter.default().addObserver(
-            forName: Notification.Name("com.apple.screenIsLocked"),
-            object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.settings.clearOnScreenLock else { return }
-            let before = self.items.count
-            self.clearUnpinned()
-            log("screen locked: cleared \(before - self.items.count) unpinned item(s)")
-        }
-    }
-
-    // MARK: Mutation
-
-    func togglePin(_ item: ClipItem) {
-        guard let i = items.firstIndex(of: item) else { return }
-        items[i].pinned.toggle()
-        save()
-    }
-
-    func delete(_ item: ClipItem) {
-        items.removeAll { $0.id == item.id }
-        save()
-    }
-
-    func clearUnpinned() {
-        items.removeAll { !$0.pinned }
-        writeNow()  // a deliberate clear should survive a crash or an immediate sleep
-    }
-
-    private func trim() {
-        var count = 0
-        items = items.filter {
-            if $0.pinned { return true }
-            count += 1
-            return count <= maxUnpinned
-        }
-    }
-}
-
-extension ISO8601DateFormatter {
-    /// Timestamps used in filenames, so no colons.
-    static let filenameSafe: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withYear, .withMonth, .withDay, .withTime]
-        f.timeZone = TimeZone(secondsFromGMT: 0)
-        return f
-    }()
-}
 
 // MARK: - SwiftUI popup
 
@@ -396,6 +12,8 @@ struct HistoryView: View {
     var onPick: (ClipItem) -> Void
     var onClose: () -> Void
     @State private var query = ""
+    @State private var selection = 0
+    @FocusState private var searchFocused: Bool
 
     private var filtered: [ClipItem] {
         let base = query.isEmpty
@@ -410,7 +28,10 @@ struct HistoryView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 14))
                 .padding(12)
-                .onSubmit { if let first = filtered.first { onPick(first) } }
+                .focused($searchFocused)
+                .accessibilityLabel("Search clipboard history")
+                .onSubmit { pickSelected() }
+                .onChange(of: query) { _ in selection = 0 }
             Divider()
             if filtered.isEmpty {
                 Spacer()
@@ -418,13 +39,18 @@ struct HistoryView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(Array(filtered.enumerated()), id: \.element.id) { index, item in
-                            row(item, index: index)
+                ScrollViewReader { scroller in
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(Array(filtered.enumerated()), id: \.element.id) { index, item in
+                                row(item, index: index).id(index)
+                            }
                         }
+                        .padding(6)
                     }
-                    .padding(6)
+                    .onChange(of: selection) { index in
+                        withAnimation(.linear(duration: 0.1)) { scroller.scrollTo(index) }
+                    }
                 }
             }
         }
@@ -432,6 +58,27 @@ struct HistoryView: View {
         .background(.regularMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .onExitCommand(perform: onClose)
+        .onAppear { selection = 0; searchFocused = true }
+        // ↑/↓ move the selection and ⏎ pastes it, so the list is usable without
+        // reaching for the mouse or memorising ⌘1…⌘9.
+        .background {
+            VStack {
+                Button("") { move(-1) }.keyboardShortcut(.upArrow, modifiers: [])
+                Button("") { move(1) }.keyboardShortcut(.downArrow, modifiers: [])
+            }
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
+    }
+
+    private func move(_ delta: Int) {
+        guard !filtered.isEmpty else { return }
+        selection = min(max(selection + delta, 0), filtered.count - 1)
+    }
+
+    private func pickSelected() {
+        guard filtered.indices.contains(selection) else { return }
+        onPick(filtered[selection])
     }
 
     @ViewBuilder
@@ -452,13 +99,22 @@ struct HistoryView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(item.pinned ? Color.accentColor : .secondary)
+            .accessibilityLabel(item.pinned ? "Unpin clip" : "Pin clip")
             Button { store.delete(item) } label: { Image(systemName: "xmark") }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
+                .accessibilityLabel("Delete clip")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(index == selection ? Color.accentColor.opacity(0.22)
+                                         : Color.primary.opacity(0.05))
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(item.pinned ? "Pinned clip: \(item.text)" : "Clip: \(item.text)")
+        .accessibilityHint("Paste this clip into the previous app")
         .background(
             // Hidden button gives ⌘1…⌘9 quick-paste shortcuts.
             Group {
@@ -469,6 +125,124 @@ struct HistoryView: View {
                 }
             }
         )
+    }
+}
+
+
+// MARK: - Preferences
+
+/// A real preferences window. settings.json stays the source of truth and remains
+/// hand-editable; this is the discoverable way to reach the same values.
+struct PreferencesView: View {
+    @ObservedObject var store: ClipStore
+    var onHotKeyChange: () -> Void
+
+    @State private var draft: ClipSettings
+    @State private var recording = false
+    @State private var excluded: String
+
+    init(store: ClipStore, onHotKeyChange: @escaping () -> Void) {
+        self.store = store
+        self.onHotKeyChange = onHotKeyChange
+        _draft = State(initialValue: store.settings)
+        _excluded = State(initialValue: store.settings.excludedBundleIDs.joined(separator: "\n"))
+    }
+
+    var body: some View {
+        Form {
+            Section("Shortcut") {
+                HStack {
+                    Text(Shortcut.describe(code: draft.hotKeyCode, modifiers: draft.hotKeyModifiers))
+                        .font(.system(size: 15, weight: .medium, design: .rounded))
+                        .frame(minWidth: 70, alignment: .leading)
+                    Button(recording ? "Press keys…" : "Change") { recording.toggle() }
+                        .accessibilityLabel("Record a new shortcut")
+                    if let error = AppDelegate.shared.hotKeyError {
+                        Text(error).foregroundStyle(.red).font(.callout)
+                    }
+                }
+                .background(ShortcutRecorder(active: $recording) { code, modifiers in
+                    draft.hotKeyCode = code
+                    draft.hotKeyModifiers = modifiers
+                    recording = false
+                })
+            }
+
+            Section("History") {
+                Stepper("Keep for \(draft.retentionDays) days (0 = forever)",
+                        value: $draft.retentionDays, in: 0...365)
+                Stepper("Largest clip: \(draft.maxItemKilobytes) KB",
+                        value: $draft.maxItemKilobytes, in: 1...10_240, step: 64)
+                Toggle("Keep styled text, HTML and file references", isOn: $draft.keepRichContent)
+                Toggle("Clear unpinned clips when the screen locks", isOn: $draft.clearOnScreenLock)
+                Toggle("Put the previous clipboard back after pasting",
+                       isOn: $draft.restoreClipboardAfterPaste)
+            }
+
+            Section("Never record copies from") {
+                TextEditor(text: $excluded)
+                    .font(.system(size: 12, design: .monospaced))
+                    .frame(height: 110)
+                    .accessibilityLabel("Excluded application bundle identifiers, one per line")
+                Text("One bundle identifier per line.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 460, height: 520)
+        .onDisappear(perform: apply)
+        .toolbar { Button("Apply", action: apply) }
+    }
+
+    private func apply() {
+        var updated = draft
+        updated.excludedBundleIDs = excluded
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let shortcutChanged = updated.hotKeyCode != store.settings.hotKeyCode
+            || updated.hotKeyModifiers != store.settings.hotKeyModifiers
+        store.apply(updated)
+        if shortcutChanged { onHotKeyChange() }
+    }
+}
+
+/// Captures the next key combination the user presses, so the shortcut can be set by
+/// pressing it rather than by editing a key code.
+struct ShortcutRecorder: NSViewRepresentable {
+    @Binding var active: Bool
+    var onCapture: (Int, Int) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = RecorderView()
+        view.onCapture = onCapture
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        guard let view = nsView as? RecorderView else { return }
+        view.onCapture = onCapture
+        view.listening = active
+        if active { view.window?.makeFirstResponder(view) }
+    }
+
+    final class RecorderView: NSView {
+        var onCapture: ((Int, Int) -> Void)?
+        var listening = false
+        override var acceptsFirstResponder: Bool { listening }
+
+        override func keyDown(with event: NSEvent) {
+            guard listening else { super.keyDown(with: event); return }
+            // Carbon masks, matching what RegisterEventHotKey expects.
+            var modifiers = 0
+            if event.modifierFlags.contains(.control) { modifiers |= 0x1000 }
+            if event.modifierFlags.contains(.option)  { modifiers |= 0x0800 }
+            if event.modifierFlags.contains(.shift)   { modifiers |= 0x0200 }
+            if event.modifierFlags.contains(.command) { modifiers |= 0x0100 }
+            guard modifiers != 0 else { NSSound.beep(); return }  // bare keys are not global shortcuts
+            listening = false
+            onCapture?(Int(event.keyCode), modifiers)
+        }
     }
 }
 
@@ -506,6 +280,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var loginItem: NSMenuItem!
     var recoveryItem: NSMenuItem!
+    var hotKeyItem: NSMenuItem!
+    var hotKeyError: String?
+    var preferencesWindow: NSWindow?
     var hotKeyRef: EventHotKeyRef?
     /// The app that was frontmost when the popup opened — the one a pick pastes into.
     var previousApp: NSRunningApplication?
@@ -673,10 +450,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// `kill -USR1 <pid>` toggles the panel, so the popup path can be exercised
-    /// without a keystroke when diagnosing hotkey problems.
+    /// without a keystroke when diagnosing hotkey problems. Debug builds only — a
+    /// release build should not expose a way to open the panel without the user.
     private var debugSignalSource: DispatchSourceSignal?
 
     private func installDebugTrigger() {
+#if DEBUG
         signal(SIGUSR1, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
         source.setEventHandler { [weak self] in
@@ -685,6 +464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         source.resume()
         debugSignalSource = source
+#endif
     }
 
     // Global hotkey: Control + Command + V
@@ -698,11 +478,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return noErr
         }, 1, &spec, nil, nil)
         log("InstallEventHandler status=\(installStatus)")
+        applyHotKey()
+    }
 
+    /// (Re)registers the configured shortcut. A failure here used to be invisible —
+    /// the user just had a dead shortcut — so it is recorded and shown in the menu.
+    func applyHotKey() {
+        if let existing = hotKeyRef {
+            UnregisterEventHotKey(existing)
+            hotKeyRef = nil
+        }
+        let code = store.settings.hotKeyCode
+        let modifiers = store.settings.hotKeyModifiers
         let id = EventHotKeyID(signature: OSType(0x434C4950), id: 1) // 'CLIP'
-        let registerStatus = RegisterEventHotKey(UInt32(kVK_ANSI_V), UInt32(controlKey | cmdKey), id,
-                                                 GetApplicationEventTarget(), 0, &hotKeyRef)
-        log("RegisterEventHotKey status=\(registerStatus) ref=\(String(describing: hotKeyRef))")
+        let status = RegisterEventHotKey(UInt32(code), UInt32(modifiers), id,
+                                         GetApplicationEventTarget(), 0, &hotKeyRef)
+        let shortcut = Shortcut.describe(code: code, modifiers: modifiers)
+        if status == noErr {
+            hotKeyError = nil
+            log("hotkey: registered \(shortcut)")
+        } else {
+            // -9878 is eventHotKeyExistsErr: another app already owns the combination.
+            hotKeyError = status == -9878
+                ? "\(shortcut) is already taken by another app"
+                : "\(shortcut) could not be registered (error \(status))"
+            log("hotkey: FAILED to register \(shortcut) — status=\(status)")
+        }
     }
 
     // Menu bar
@@ -713,10 +514,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                            accessibilityDescription: "Clipboard History")
         let menu = NSMenu()
         menu.delegate = self
-        menu.addItem(withTitle: "Show History  (⌃⌘V)", action: #selector(showHistory), keyEquivalent: "").target = self
+        hotKeyItem = menu.addItem(withTitle: "Show History", action: #selector(showHistory),
+                                  keyEquivalent: "")
+        hotKeyItem.target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Clear History", action: #selector(clearHistory), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Edit Settings…", action: #selector(editSettings), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Settings…", action: #selector(showPreferences), keyEquivalent: ",").target = self
+        menu.addItem(withTitle: "Reveal Settings File", action: #selector(editSettings), keyEquivalent: "").target = self
         loginItem = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
         menu.addItem(.separator())
@@ -730,6 +534,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        // A shortcut that failed to register must say so rather than just not working.
+        let shortcut = Shortcut.describe(code: store.settings.hotKeyCode,
+                                         modifiers: store.settings.hotKeyModifiers)
+        hotKeyItem.title = hotKeyError.map { "Show History  —  ⚠︎ \($0)" }
+            ?? "Show History  (\(shortcut))"
         // Losing a history file should be visible in the app, not just in the log.
         if let preserved = store.loadFailure {
             recoveryItem.title = "⚠︎ Previous history kept as \(preserved)"
@@ -741,6 +550,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showHistory() { togglePanel() }
     @objc private func clearHistory() { store.clearUnpinned() }
+
+    @objc private func showPreferences() {
+        if preferencesWindow == nil {
+            let view = PreferencesView(store: store) { [weak self] in self?.applyHotKey() }
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 520),
+                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "ClipStack Settings"
+            window.contentView = NSHostingView(rootView: view)
+            window.isReleasedWhenClosed = false
+            window.center()
+            preferencesWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        preferencesWindow?.makeKeyAndOrderFront(nil)
+    }
 
     @objc private func editSettings() {
         NSWorkspace.shared.open(store.settingsFileURL)
