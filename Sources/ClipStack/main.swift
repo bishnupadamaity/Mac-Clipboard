@@ -52,6 +52,12 @@ struct ClipSettings: Codable {
     var clearOnScreenLock: Bool = false
     /// Apps whose copies are never recorded.
     var excludedBundleIDs: [String] = ClipSettings.defaultExcludedBundleIDs
+    /// Largest clip to keep. Bigger copies stay on the system clipboard but are not
+    /// stored, so one huge paste cannot bloat every subsequent write.
+    var maxItemKilobytes: Int = 1024
+    /// Put the previous clipboard back after pasting a picked item, so a following
+    /// ⌘V does what the user expects rather than repeating the pick.
+    var restoreClipboardAfterPaste: Bool = true
 
     /// The org.nspasteboard.* markers cover apps that cooperate. These are the common
     /// credential holders that do not set them, so they have to be excluded by identity.
@@ -85,6 +91,7 @@ final class ClipStore: ObservableObject {
     /// Set when history could not be parsed *and* could not be moved aside. Saving
     /// would then overwrite the only copy, so it is refused.
     private var savingDisabled = false
+    private var pendingSave: DispatchWorkItem?
 
     var settingsFileURL: URL { settingsURL }
 
@@ -108,9 +115,19 @@ final class ClipStore: ObservableObject {
         load()
         expire()
 
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        // .common, not the default mode: while a menu is tracking or a window is being
+        // resized the run loop leaves the default mode, and a default-mode timer stops
+        // firing — copies made during that window were silently missed.
+        // .common rather than the default mode. In-process event tracking — a drag, a
+        // resize, a modal tracking loop — leaves the default mode and stops a
+        // default-mode timer firing. Status-bar menus turned out not to block this
+        // app's run loop on macOS 27, so this is hardening against the tracking loops
+        // that do, not a fix for an observed miss.
+        let poller = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.poll()
         }
+        RunLoop.main.add(poller, forMode: .common)
+        timer = poller
         observeScreenLock()
     }
 
@@ -144,7 +161,20 @@ final class ClipStore: ObservableObject {
         }
     }
 
+    /// Coalesces bursts of changes into one write. The whole history is re-encoded on
+    /// every save, so writing once per copy was wasteful; callers that must not lose
+    /// data on a crash use `writeNow()` instead.
     private func save() {
+        pendingSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.writeNow() }
+        pendingSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: work)
+    }
+
+    /// Writes immediately, cancelling any debounced write.
+    func writeNow() {
+        pendingSave?.cancel()
+        pendingSave = nil
         guard !savingDisabled else {
             log("history: save refused — an unreadable history file is still in place")
             return
@@ -231,6 +261,13 @@ final class ClipStore: ObservableObject {
 
         guard let s = pb.string(forType: .string),
               !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        let limit = max(1, settings.maxItemKilobytes) * 1024
+        let size = s.utf8.count
+        if size > limit {
+            log("capture: skipped a \(size / 1024) KB clip (limit \(limit / 1024) KB)")
+            return
+        }
         add(s)
     }
 
@@ -245,6 +282,35 @@ final class ClipStore: ObservableObject {
         expire(save: false)
         trim()
         save()
+    }
+
+    /// Everything currently on the pasteboard, flavour by flavour, so it can be put
+    /// back verbatim after a paste.
+    func snapshotPasteboard() -> [[String: Data]] {
+        (NSPasteboard.general.pasteboardItems ?? []).map { item in
+            var flavours: [String: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) { flavours[type.rawValue] = data }
+            }
+            return flavours
+        }
+    }
+
+    /// Puts a snapshot back and suppresses re-capture, so restoring does not register
+    /// as a new copy.
+    func restorePasteboard(_ snapshot: [[String: Data]]) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        let restored = snapshot.compactMap { flavours -> NSPasteboardItem? in
+            guard !flavours.isEmpty else { return nil }
+            let item = NSPasteboardItem()
+            for (type, data) in flavours {
+                item.setData(data, forType: NSPasteboard.PasteboardType(type))
+            }
+            return item
+        }
+        if !restored.isEmpty { pb.writeObjects(restored) }
+        lastChangeCount = pb.changeCount
     }
 
     /// Puts an item on the system clipboard without it being re-added as "new".
@@ -300,7 +366,7 @@ final class ClipStore: ObservableObject {
 
     func clearUnpinned() {
         items.removeAll { !$0.pinned }
-        save()
+        writeNow()  // a deliberate clear should survive a crash or an immediate sleep
     }
 
     private func trim() {
@@ -450,6 +516,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A second copy would register the same hotkey and one of them would silently
+        // lose it — exactly what made a stale build so confusing to diagnose.
+        if let running = otherRunningInstance() {
+            log("another instance is already running (pid \(running.processIdentifier)) — exiting")
+            running.activate(options: [])
+            NSApp.terminate(nil)
+            return
+        }
         NSApp.setActivationPolicy(.accessory)
         setupPanel()
         setupStatusItem()
@@ -470,6 +544,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.panel.orderOut(nil)
         }
         installDebugTrigger()
+    }
+
+    private func otherRunningInstance() -> NSRunningApplication? {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return nil }
+        let mine = ProcessInfo.processInfo.processIdentifier
+        return NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .first { $0.processIdentifier != mine }
+    }
+
+    /// Debounced writes must not be lost when the app quits.
+    func applicationWillTerminate(_ notification: Notification) {
+        store.writeNow()
     }
 
     // Panel
@@ -530,6 +616,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let target = previousApp
         log("paste: axTrusted=\(AXIsProcessTrusted()) len=\(item.text.count) "
             + "target=\(target?.localizedName ?? "none")")
+
+        // Captured before the pick overwrites it, so the user's clipboard can be put
+        // back afterwards instead of being silently replaced by whatever they pasted.
+        let previousClipboard = store.settings.restoreClipboardAfterPaste
+            ? store.snapshotPasteboard() : nil
+
         store.copyToPasteboard(item)
         // Give focus back to the app the user came from before synthesising ⌘V.
         hidePanel(restoreFocus: true)
@@ -537,20 +629,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("paste: no Accessibility permission — text is on the clipboard, ⌘V pastes it manually")
             return
         }
-        postPaste(into: target, attempt: 0)
+        postPaste(into: target, attempt: 0, restoring: previousClipboard)
     }
 
     /// Posts ⌘V once the target app is actually frontmost and the user's own modifier
     /// keys are up. Posting while ⌃⌘ are still physically held turns the synthetic ⌘V
     /// into ⌃⌘V — which is not Paste, and re-triggers our own hotkey.
-    private func postPaste(into target: NSRunningApplication?, attempt: Int) {
+    private func postPaste(into target: NSRunningApplication?, attempt: Int,
+                           restoring previousClipboard: [[String: Data]]? = nil) {
         let held = CGEventSource.flagsState(.combinedSessionState)
             .intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
         let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let isFront = target == nil || frontPid == target?.processIdentifier
         if (!isFront || !held.isEmpty) && attempt < 40 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self] in
-                self?.postPaste(into: target, attempt: attempt + 1)
+                self?.postPaste(into: target, attempt: attempt + 1, restoring: previousClipboard)
             }
             return
         }
@@ -569,6 +662,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         up.post(tap: .cghidEventTap)
         log("paste: posted ⌘V after \(attempt) wait(s), front="
             + "\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")")
+
+        // Restore only once the target app has had time to read the pasteboard.
+        if let previousClipboard {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.store.restorePasteboard(previousClipboard)
+                log("paste: restored the previous clipboard")
+            }
+        }
     }
 
     /// `kill -USR1 <pid>` toggles the panel, so the popup path can be exercised
