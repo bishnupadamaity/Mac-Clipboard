@@ -1,0 +1,16 @@
+# Swift Package Manager build output
+.build/
+.swiftpm/
+
+# Built application bundle and debug symbols
+*.app/
+*.dSYM/
+
+# Notarisation artefacts
+*.zip
+
+# macOS
+.DS_Store
+
+# Machine-local signing identity pin (never commit: personal certificate name)
+.signing-identity.local
